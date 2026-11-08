@@ -787,12 +787,9 @@ class GiteeAIImagePlugin(Star):
         # 动态注册预设命令 (方案C: /手办化 直接触发)
         self._register_preset_commands()
 
-        if callable(getattr(self.context, "register_web_api", None)):
-            from .core.studio import Studio
-
-            self.studio = Studio(self)
-            await self.studio.start()
-
+        # 注意：Studio（Web API / 配置页）依赖 AstrBot Web 服务就绪，
+        # 故延迟到 on_astrbot_loaded() 中启动，避免冷启动时注册失败、
+        # 必须手动重载一次插件的问题。
         logger.info(
             f"[GiteeAIImagePlugin] 插件初始化完成: "
             f"改图后端={self.edit.get_available_backends()}, "
@@ -803,11 +800,39 @@ class GiteeAIImagePlugin(Star):
             f"LLM后台生图={background_status}"
         )
 
+    async def _start_studio_if_ready(self) -> None:
+        """在 Web API 可用时启动 Studio；幂等，失败不影响其它功能。"""
+
+        if getattr(self, "studio", None) is not None:
+            return
+        if not callable(getattr(self.context, "register_web_api", None)):
+            return
+        try:
+            from .core.studio import Studio
+
+            self.studio = Studio(self)
+            await self.studio.start()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[GiteeAIImagePlugin] Studio start deferred/failed: %s", exc
+            )
+            self.studio = None
+
     @filter.on_astrbot_loaded()
     async def on_background_astrbot_loaded(self) -> None:
         """Drain restart recovery notifications after platforms are available."""
 
         self._background_astrbot_loaded = True
+        # AstrBot 全栈（Web 服务 / 上下文）已就绪，此时启动 Studio 并补全补丁，
+        # 规避“重启后插件必须手动重载一次”的问题。
+        try:
+            self._patch_tool_image_cache_runtime()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[GiteeAIImagePlugin] tool image cache patch skipped: %s", exc)
+        try:
+            await self._start_studio_if_ready()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[GiteeAIImagePlugin] Studio start skipped: %s", exc)
         manager = getattr(self, "background_tasks", None)
         if manager is None:
             return
