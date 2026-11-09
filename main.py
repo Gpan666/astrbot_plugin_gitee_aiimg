@@ -801,11 +801,56 @@ class GiteeAIImagePlugin(Star):
         )
 
     async def _start_studio_if_ready(self) -> None:
-        """在 Web API 可用时启动 Studio；幂等，失败不影响其它功能。"""
+        """在 Web API 可用且全局后台管理器就绪时启动 Studio；幂等，失败不影响其它功能。
+
+        关键点：Studio 仅在 self.background_tasks 就绪后才启动，避免其自建
+        own_manager 与全局后台管理器争抢同一把 owner 租约锁（这正是此前
+        “形象库未就绪 / aiimg_characters 返回空”的根因）。若全局后台管理器
+        仍在等待前进程残留的 owner 租约回收，则派发后台任务等待其就绪后再启动。
+        """
 
         if getattr(self, "studio", None) is not None:
             return
         if not callable(getattr(self.context, "register_web_api", None)):
+            return
+        # 全局后台管理器尚未拿到 owner 租约（background_tasks 仍为 None），
+        # 不要此时自建 own_manager 抢锁，改为等待其就绪后再启动 Studio。
+        if getattr(self, "background_tasks", None) is None:
+            self._studio_start_task = asyncio.create_task(
+                self._start_studio_after_background(),
+                name="gitee-aiimg-studio-start",
+            )
+            return
+        try:
+            from .core.studio import Studio
+
+            self.studio = Studio(self)
+            await self.studio.start()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[GiteeAIImagePlugin] Studio start deferred/failed: %s", exc
+            )
+            self.studio = None
+
+    async def _start_studio_after_background(self) -> None:
+        """等待全局后台管理器就绪（owner 租约回收）后再启动 Studio。
+
+        全局后台管理器在 initialize() 抢锁失败时会进入 waiting_for_owner 重试，
+        最多约 lease_seconds（默认 45s）后自行拿到租约并置 background_tasks。
+        此处轮询等待，避免 Studio 自建 own_manager 与之冲突。
+        """
+
+        for _ in range(180):  # 最多等 180s
+            if getattr(self, "background_tasks", None) is not None:
+                break
+            await asyncio.sleep(1)
+        else:
+            logger.warning(
+                "[GiteeAIImagePlugin] Studio start skipped: "
+                "background_tasks 在等待期内仍未就绪"
+            )
+            return
+        if getattr(self, "studio", None) is not None:
             return
         try:
             from .core.studio import Studio
