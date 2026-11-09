@@ -93,10 +93,18 @@ class Studio:
         if self.plugin.background_tasks is None and not self.plugin._get_feature(
             "background_llm_image"
         ).get("enabled", False):
-            self.own_manager = BackgroundImageTaskManager(
-                self.store.root / "queue", max_running=2, max_queued=16
-            )
-            await self.own_manager.start()
+            try:
+                self.own_manager = BackgroundImageTaskManager(
+                    self.store.root / "queue", max_running=2, max_queued=16
+                )
+                await self.own_manager.start()
+            except Exception as _exc:  # noqa: BLE001
+                # 抢 owner 租约失败不应阻断 Studio（store 仍可用，仅后台生图降级）。
+                logger.warning(
+                    "[studio] own_manager start failed; background mode degraded: %s",
+                    _exc,
+                )
+                self.own_manager = None
         for action in (
             "state",
             "config",

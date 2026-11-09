@@ -787,9 +787,11 @@ class GiteeAIImagePlugin(Star):
         # 动态注册预设命令 (方案C: /手办化 直接触发)
         self._register_preset_commands()
 
-        # 注意：Studio（Web API / 配置页）依赖 AstrBot Web 服务就绪，
-        # 故延迟到 on_astrbot_loaded() 中启动，避免冷启动时注册失败、
-        # 必须手动重载一次插件的问题。
+        # Studio 启动入口改到 initialize 末尾派发（见 _ensure_studio_started）：
+        # 冷启动与热重载都会执行 initialize，故 Studio 必然重新启动并重新注册
+        # / 覆盖 Web 路由（register_web_api 会覆盖同名残留路由），彻底解决
+        # 热重载后"形象库未就绪 / aiimg_characters 返回空"的问题。
+        await self._ensure_studio_started()
         logger.info(
             f"[GiteeAIImagePlugin] 插件初始化完成: "
             f"改图后端={self.edit.get_available_backends()}, "
@@ -800,47 +802,49 @@ class GiteeAIImagePlugin(Star):
             f"LLM后台生图={background_status}"
         )
 
-    async def _start_studio_if_ready(self) -> None:
-        """在 Web API 可用且全局后台管理器就绪时启动 Studio；幂等，失败不影响其它功能。
+    async def _ensure_studio_started(self) -> None:
+        """确保 Studio 已启动（冷启动与热重载均会调用，幂等）。
 
-        关键点：Studio 仅在 self.background_tasks 就绪后才启动，避免其自建
-        own_manager 与全局后台管理器争抢同一把 owner 租约锁（这正是此前
-        “形象库未就绪 / aiimg_characters 返回空”的根因）。若全局后台管理器
-        仍在等待前进程残留的 owner 租约回收，则派发后台任务等待其就绪后再启动。
+        之前 Studio 仅在 @filter.on_astrbot_loaded() 钩子里启动，而该钩子
+        只在 AstrBot 冷启动时触发一次；插件热重载时不会重触发，导致新实例
+        的 self.studio 永远为 None -> aiimg_characters 返回空 /
+        "形象库未就绪"，且旧 Studio 的 Web 路由残留（register_web_api 会
+        覆盖同名路由，但前提是新 Studio 必须重新 start）。
+
+        改为在 initialize() 末尾派发本协程对应的后台任务，无论冷启动还是
+        热重载都会重新启动 Studio 并注册/覆盖 Web 路由，彻底解决该问题。
         """
 
         if getattr(self, "studio", None) is not None:
             return
-        if not callable(getattr(self.context, "register_web_api", None)):
+        task = getattr(self, "_studio_ensure_task", None)
+        if task is not None and not task.done():
             return
-        # 全局后台管理器尚未拿到 owner 租约（background_tasks 仍为 None），
-        # 不要此时自建 own_manager 抢锁，改为等待其就绪后再启动 Studio。
-        if getattr(self, "background_tasks", None) is None:
-            self._studio_start_task = asyncio.create_task(
-                self._start_studio_after_background(),
-                name="gitee-aiimg-studio-start",
-            )
-            return
-        try:
-            from .core.studio import Studio
+        self._studio_ensure_task = asyncio.create_task(
+            self._start_studio_after_ready(),
+            name="gitee-aiimg-studio-ensure",
+        )
 
-            self.studio = Studio(self)
-            await self.studio.start()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "[GiteeAIImagePlugin] Studio start deferred/failed: %s", exc
-            )
-            self.studio = None
+    async def _start_studio_after_ready(self) -> None:
+        """轮询等待 Web API 与全局后台管理器就绪后启动 Studio。
 
-    async def _start_studio_after_background(self) -> None:
-        """等待全局后台管理器就绪（owner 租约回收）后再启动 Studio。
-
-        全局后台管理器在 initialize() 抢锁失败时会进入 waiting_for_owner 重试，
-        最多约 lease_seconds（默认 45s）后自行拿到租约并置 background_tasks。
-        此处轮询等待，避免 Studio 自建 own_manager 与之冲突。
+        先等待 register_web_api 可用（Web 服务就绪），再等待 background_tasks
+        就绪（owner 租约回收，避免 Studio 自建 own_manager 与之抢锁），就绪后
+        启动 Studio；启动时通过 register_web_api 覆盖同名残留路由。
         """
 
-        for _ in range(180):  # 最多等 180s
+        # 等待 Web 服务可用
+        for _ in range(120):  # 最多 60s
+            if callable(getattr(self.context, "register_web_api", None)):
+                break
+            await asyncio.sleep(0.5)
+        else:
+            logger.warning(
+                "[GiteeAIImagePlugin] Studio start skipped: register_web_api 不可用"
+            )
+            return
+        # 等待全局后台管理器拿到 owner 租约（background_tasks 置位）
+        for _ in range(180):  # 最多 180s
             if getattr(self, "background_tasks", None) is not None:
                 break
             await asyncio.sleep(1)
@@ -857,6 +861,9 @@ class GiteeAIImagePlugin(Star):
 
             self.studio = Studio(self)
             await self.studio.start()
+            logger.info(
+                "[GiteeAIImagePlugin] Studio 启动完成（已注册/覆盖 Web 路由）"
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "[GiteeAIImagePlugin] Studio start deferred/failed: %s", exc
@@ -875,7 +882,7 @@ class GiteeAIImagePlugin(Star):
         except Exception as exc:  # noqa: BLE001
             logger.debug("[GiteeAIImagePlugin] tool image cache patch skipped: %s", exc)
         try:
-            await self._start_studio_if_ready()
+            await self._ensure_studio_started()
         except Exception as exc:  # noqa: BLE001
             logger.warning("[GiteeAIImagePlugin] Studio start skipped: %s", exc)
         manager = getattr(self, "background_tasks", None)
@@ -2459,8 +2466,18 @@ class GiteeAIImagePlugin(Star):
         return False
 
     async def terminate(self):
-        if getattr(self, "studio", None):
-            await self.studio.close()
+        for _t in ("_studio_ensure_task", "_studio_start_task"):
+            _task = getattr(self, _t, None)
+            if _task is not None and not _task.done():
+                _task.cancel()
+                await asyncio.gather(_task, return_exceptions=True)
+        studio = getattr(self, "studio", None)
+        if studio is not None:
+            try:
+                await studio.close()
+            except Exception as _exc:
+                logger.error("[GiteeAIImagePlugin] studio close failed: %s", _exc)
+            self.studio = None
         self.debouncer.clear_all()
         start_task = getattr(self, "_background_start_task", None)
         if start_task is not None:
